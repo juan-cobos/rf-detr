@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from rfdetr.models.backbone.base import BackboneBase
 from rfdetr.models.backbone.dinov2 import DinoV2
+from rfdetr.models.backbone.eupe import EUPEEncoder
 from rfdetr.models.backbone.projector import MultiScaleProjector
 from rfdetr.utilities.logger import get_logger
 from rfdetr.utilities.tensors import NestedTensor
@@ -62,32 +63,43 @@ class Backbone(BackboneBase):
         # the last part of the name should be the size
         # and the start should be dinov2
         name_parts = name.split("_")
-        assert name_parts[0] == "dinov2"
-        # name_parts[-1]
-        use_registers = False
-        if "registers" in name_parts:
-            use_registers = True
-            name_parts.remove("registers")
-        use_windowed_attn = False
-        if "windowed" in name_parts:
-            use_windowed_attn = True
-            name_parts.remove("windowed")
-        assert len(name_parts) == 2, (
-            "name should be dinov2, then either registers, windowed, both, or none, then the size"
-        )
-        self.encoder = DinoV2(
-            size=name_parts[-1],
-            out_feature_indexes=out_feature_indexes,
-            shape=target_shape,
-            use_registers=use_registers,
-            use_windowed_attn=use_windowed_attn,
-            gradient_checkpointing=gradient_checkpointing,
-            load_dinov2_weights=load_dinov2_weights,
-            patch_size=patch_size,
-            num_windows=num_windows,
-            positional_encoding_size=positional_encoding_size,
-            drop_path_rate=drop_path,
-        )
+        if name_parts[0] == "eupe":
+            assert len(name_parts) == 2, "EUPE backbone name must be 'eupe_<size>' (tiny/small/base)"
+            self.encoder = EUPEEncoder(
+                size=name_parts[1],
+                out_feature_indexes=out_feature_indexes,
+                shape=target_shape,
+                patch_size=patch_size,
+                num_windows=num_windows,
+                gradient_checkpointing=gradient_checkpointing,
+            )
+        elif name_parts[0] == "dinov2":
+            use_registers = False
+            if "registers" in name_parts:
+                use_registers = True
+                name_parts.remove("registers")
+            use_windowed_attn = False
+            if "windowed" in name_parts:
+                use_windowed_attn = True
+                name_parts.remove("windowed")
+            assert len(name_parts) == 2, (
+                "name should be dinov2, then either registers, windowed, both, or none, then the size"
+            )
+            self.encoder = DinoV2(
+                size=name_parts[-1],
+                out_feature_indexes=out_feature_indexes,
+                shape=target_shape,
+                use_registers=use_registers,
+                use_windowed_attn=use_windowed_attn,
+                gradient_checkpointing=gradient_checkpointing,
+                load_dinov2_weights=load_dinov2_weights,
+                patch_size=patch_size,
+                num_windows=num_windows,
+                positional_encoding_size=positional_encoding_size,
+                drop_path_rate=drop_path,
+            )
+        else:
+            raise ValueError(f"Unknown backbone family '{name_parts[0]}'. Expected 'dinov2' or 'eupe'.")
         # build encoder + projector as backbone module
         if freeze_encoder:
             for param in self.encoder.parameters():
@@ -163,19 +175,35 @@ class Backbone(BackboneBase):
         num_layers = args.out_feature_indexes[-1] + 1
         backbone_key = "backbone.0.encoder"
         named_param_lr_pairs = {}
+
+        # Determine if using EUPE encoder
+        is_eupe = isinstance(self.encoder, EUPEEncoder)
+
         for n, p in self.named_parameters():
             n = prefix + "." + n
             if backbone_key in n and p.requires_grad:
-                lr = (
-                    args.lr_encoder
-                    * get_dinov2_lr_decay_rate(
-                        n,
-                        lr_decay_rate=args.lr_vit_layer_decay,
-                        num_layers=num_layers,
+                if is_eupe:
+                    lr = (
+                        args.lr_encoder
+                        * get_eupe_lr_decay_rate(
+                            n,
+                            lr_decay_rate=args.lr_vit_layer_decay,
+                            num_layers=num_layers,
+                        )
+                        * args.lr_component_decay**2
                     )
-                    * args.lr_component_decay**2
-                )
-                wd = args.weight_decay * get_dinov2_weight_decay_rate(n)
+                    wd = args.weight_decay * get_eupe_weight_decay_rate(n)
+                else:
+                    lr = (
+                        args.lr_encoder
+                        * get_dinov2_lr_decay_rate(
+                            n,
+                            lr_decay_rate=args.lr_vit_layer_decay,
+                            num_layers=num_layers,
+                        )
+                        * args.lr_component_decay**2
+                    )
+                    wd = args.weight_decay * get_dinov2_weight_decay_rate(n)
                 named_param_lr_pairs[n] = {
                     "params": p,
                     "lr": lr,
@@ -213,6 +241,68 @@ def get_dinov2_weight_decay_rate(name, weight_decay_rate=1.0):
         or ("bias" in name)
         or ("norm" in name)
         or ("embeddings" in name)
+    ):
+        weight_decay_rate = 0.0
+    return weight_decay_rate
+
+
+def get_eupe_lr_decay_rate(name: str, lr_decay_rate: float = 1.0, num_layers: int = 12) -> float:
+    """
+    Calculate lr decay rate for EUPE ViT blocks.
+
+    EUPE uses a slightly different naming convention than DinoV2:
+    - Patch embed: encoder.encoder.patch_embed
+    - Blocks: encoder.encoder.blocks[i]
+    - Norm: encoder.encoder.norm
+
+    Args:
+        name: Parameter name.
+        lr_decay_rate: Base lr decay rate.
+        num_layers: Number of ViT blocks.
+
+    Returns:
+        Lr decay rate for the given parameter.
+    """
+    layer_id = num_layers + 1
+    if name.startswith("backbone"):
+        if "patch_embed" in name or "cls_token" in name or "pos_embed" in name:
+            layer_id = 0
+        elif "blocks." in name:
+            # Extract block index from names like "encoder.encoder.blocks.0.norm1.weight"
+            try:
+                block_idx = int(name.split("blocks.")[1].split(".")[0])
+                layer_id = block_idx + 1
+            except (ValueError, IndexError):
+                layer_id = num_layers + 1
+        elif "norm" in name:
+            # Final norm layer gets highest layer_id (least decay)
+            layer_id = num_layers + 1
+    return lr_decay_rate ** (num_layers + 1 - layer_id)
+
+
+def get_eupe_weight_decay_rate(name, weight_decay_rate=1.0):
+    """
+    Calculate weight decay rate for EUPE parameters.
+
+    EUPE follows similar conventions to DinoV2 for weight decay exclusions:
+    - No weight decay for bias terms
+    - No weight decay for normalization layers
+    - No weight decay for position embeddings
+    - No weight decay for class token
+
+    Args:
+        name: Parameter name.
+        weight_decay_rate: Base weight decay rate.
+
+    Returns:
+        Weight decay rate for the given parameter.
+    """
+    if (
+        ("bias" in name)
+        or ("norm" in name)
+        or ("pos_embed" in name)
+        or ("cls_token" in name)
+        or ("patch_embed" in name and "proj" not in name)
     ):
         weight_decay_rate = 0.0
     return weight_decay_rate
